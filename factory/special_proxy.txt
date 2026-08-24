@@ -1,0 +1,15 @@
+# 特殊需求代理名单
+#
+# 使用方法：
+# 1. 将需要强制分流的域名、IP 或网段写在下方，每行一条。
+# 2. 可以写 example.com、*.example.com、https://example.com/path、
+#    1.2.3.4、1.2.3.0/24 或 IPv6 网段。URL 只按主机名匹配，不匹配路径。
+# 3. 以 # 开头的行是注释；空行会被忽略。
+# 4. 请将本文件上传到仓库 build 分支的 factory/special_proxy.txt。
+# 5. GitHub Actions 每天 08:30 构建时，会生成 release/special_proxy.list，
+#    并由 lazy_group.conf 的「特殊需求」策略组加载。
+#
+# 示例（取消行首 # 才会生效）：
+# example.com
+# api.example.com
+# 1.2.3.0/24
