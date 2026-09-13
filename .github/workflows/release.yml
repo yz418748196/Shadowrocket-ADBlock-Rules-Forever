@@ -1,0 +1,342 @@
+name: Release Shadowrocket Rules
+
+on:
+  schedule:
+    # 每日北京时间 08:30 计划运行；GitHub Actions 实际可能晚几分钟。
+    - cron: '30 0 * * *'
+
+  push:
+    branches:
+      - build
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+  pull_request_target:
+    branches:
+      - build
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+  workflow_dispatch:
+
+jobs:
+  Release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: build
+          path: build
+
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+          path: release
+
+      - name: Install requirements
+        run: pip3 install -r build/requirements.txt
+
+      - name: Build Rules
+        run: |
+          cd build || exit 1
+          ./factory/auto_build.sh
+
+      - name: Move files
+        run: |
+          cd build || exit 1
+          cp *.conf ../release/
+          cp -r figure ../release/
+          cp LICENSE ../release/
+          cp readme.md ../release/
+
+      - name: Update lazy rules
+        env:
+          AIRPORTS: ${{ vars.AIRPORTS }}
+          AI_DEFAULT: ${{ vars.AI_DEFAULT }}
+          SPECIAL_DEFAULT: ${{ vars.SPECIAL_DEFAULT }}
+          TIKTOK_DEFAULT: ${{ vars.TIKTOK_DEFAULT }}
+        run: |
+          cd release || exit 1
+
+          rm -f lazy.conf lazy_group.conf
+          curl -fL --retry 3 -O https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf
+          curl -fL --retry 3 -O https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy_group.conf
+
+          # 固定需求：
+          # 1. 保留 LOWERTOP 原版六个地区组的名称与位置，改为机场手选组。
+          # 2. 每个默认地区组只显示该地区的各机场子组，默认选择 KTM。
+          # 3. 每个机场分别生成六个地区测速组，按地区成对排列。
+          # 4. AI 独立手选机场地区组，默认台湾节点-KTM。
+          # 5. 特殊需求独立手选，默认香港 KTM；规则来自 build/factory/special_proxy.txt。
+          # 6. TikTok 独立手选机场地区组，默认日本节点-KTM。
+          # 7. 不预检机场地区；单个子组为空时仍继续发布，由其余策略兜底。
+          # 8. AIRPORTS 仓库变量是机场名单的唯一来源；未设置时停止构建，避免静默漏掉机场。
+          python3 - <<'PY'
+          import ipaddress
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          CONF = Path("lazy_group.conf")
+          SPECIAL_SOURCE = Path("../build/factory/special_proxy.txt")
+          SPECIAL_LIST = Path("special_proxy.list")
+
+          # 专属组故意不使用 HK / TW / JP / US 等短代码，
+          # 避免把套餐、剩余流量等项目误识别为地区节点。
+          REGIONS = [
+              ("香港", r"🇭🇰|香港|Hong\ Kong|HongKong"),
+              ("台湾", r"🇹🇼|台湾|台灣|台北|台中|新北|彰化|Taiwan|Taipei"),
+              ("日本", r"🇯🇵|日本|东京|東京|大阪|Japan|Tokyo|Osaka"),
+              ("新加坡", r"🇸🇬|新加坡|狮城|獅城|Singapore"),
+              ("韩国", r"🇰🇷|韩国|韓國|首尔|首爾|Korea|Seoul"),
+              ("美国", r"🇺🇸|美国|美國|洛杉矶|洛杉磯|圣何塞|聖何塞|西雅图|西雅圖|纽约|紐約|United\ States"),
+          ]
+          POLICY_REGION_ORDER = ("台湾", "香港", "日本", "新加坡", "韩国", "美国")
+
+          airport_text = os.environ.get("AIRPORTS", "").strip()
+          if not airport_text:
+              raise SystemExit(
+                  "ERROR: 未设置 Repository variable AIRPORTS。"
+                  "请在 Settings > Secrets and variables > Actions > Variables "
+                  "中设置 AIRPORTS，例如：KTM,KTM普通,魔戒"
+              )
+          PROVIDERS = tuple(
+              dict.fromkeys(
+                  item.strip()
+                  for item in airport_text.replace("，", ",").split(",")
+                  if item.strip()
+              )
+          )
+          if not PROVIDERS:
+              raise SystemExit("ERROR: AIRPORTS 没有有效的机场名称。")
+          if any(any(char in provider for char in "\r\n=") for provider in PROVIDERS):
+              raise SystemExit("ERROR: AIRPORTS 的机场名称不能包含换行或等号。")
+
+          DEFAULT_PROVIDER = "KTM" if "KTM" in PROVIDERS else PROVIDERS[0]
+          POLICY_CHOICES = tuple(
+              f"{region}节点-{provider}"
+              for region in POLICY_REGION_ORDER
+              for provider in PROVIDERS
+          )
+          ALLOWED_DEFAULTS = {"PROXY", *POLICY_CHOICES}
+
+          def resolve_default(variable, fallback):
+              value = os.environ.get(variable, "").strip() or fallback
+              if value not in ALLOWED_DEFAULTS:
+                  choices = "、".join(sorted(ALLOWED_DEFAULTS))
+                  raise SystemExit(
+                      f"ERROR: {variable}={value} 不是有效策略，可选：{choices}"
+                  )
+              return value
+
+          AI_DEFAULT = resolve_default(
+              "AI_DEFAULT", f"台湾节点-{DEFAULT_PROVIDER}"
+          )
+          SPECIAL_DEFAULT = resolve_default(
+              "SPECIAL_DEFAULT", f"香港节点-{DEFAULT_PROVIDER}"
+          )
+          TIKTOK_DEFAULT = resolve_default(
+              "TIKTOK_DEFAULT", f"日本节点-{DEFAULT_PROVIDER}"
+          )
+
+          def select_group(name, default):
+              return (
+                  f"{name} = select,PROXY,"
+                  + ",".join(POLICY_CHOICES)
+                  + f",policy-select-name={default}"
+              )
+
+          AI_GROUP = select_group("AI", AI_DEFAULT)
+          SPECIAL_GROUP = select_group("特殊需求", SPECIAL_DEFAULT)
+          TIKTOK_GROUP = select_group("TikTok", TIKTOK_DEFAULT)
+          repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+          if not repository or not re.fullmatch(
+              r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+          ):
+              raise SystemExit("ERROR: GITHUB_REPOSITORY 无效，无法生成自定义规则地址。")
+          SPECIAL_RULE = (
+              "RULE-SET,https://raw.githubusercontent.com/"
+              f"{repository}/release/special_proxy.list,特殊需求"
+          )
+          AI_RULE = (
+              "RULE-SET,https://raw.githubusercontent.com/"
+              "iab0x00/ProxyRules/main/Rule/AI.txt,AI"
+          )
+
+          def provider_group(region, regex, provider):
+              return (
+                  f"{region}节点-{provider} = url-test,{provider},use=true,"
+                  "url=http://www.gstatic.com/generate_204,"
+                  "interval=600,tolerance=0,timeout=5,select=0,"
+                  f"policy-regex-filter={regex}"
+              )
+
+          def special_rule_entry(value, line_number):
+              """将一行人类可读的域名/IP 转为 Shadowrocket Rule Set 格式。"""
+              if "://" in value:
+                  hostname = urlsplit(value).hostname
+                  if not hostname:
+                      raise SystemExit(
+                          f"ERROR: special_proxy.txt 第 {line_number} 行 URL 无效：{value}"
+                      )
+                  value = hostname
+
+              value = value.strip().rstrip(".")
+              if value.startswith("*."):
+                  value = value[2:]
+
+              try:
+                  network = ipaddress.ip_network(value, strict=False)
+              except ValueError:
+                  if any(char.isspace() for char in value) or "/" in value:
+                      raise SystemExit(
+                          f"ERROR: special_proxy.txt 第 {line_number} 行格式无效：{value}"
+                      )
+                  try:
+                      domain = value.encode("idna").decode("ascii").lower()
+                  except UnicodeError:
+                      raise SystemExit(
+                          f"ERROR: special_proxy.txt 第 {line_number} 行域名无效：{value}"
+                      )
+                  if not re.fullmatch(
+                      r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+                      r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+                      domain,
+                  ):
+                      raise SystemExit(
+                          f"ERROR: special_proxy.txt 第 {line_number} 行域名无效：{value}"
+                      )
+                  return f"DOMAIN-SUFFIX,{domain}"
+
+              rule_type = "IP-CIDR" if network.version == 4 else "IP-CIDR6"
+              return f"{rule_type},{network.with_prefixlen},no-resolve"
+
+          if not SPECIAL_SOURCE.is_file():
+              raise SystemExit(
+                  "ERROR: 缺少 build/factory/special_proxy.txt，请与工作流一起上传。"
+              )
+
+          special_rules = []
+          for line_number, raw_line in enumerate(
+              SPECIAL_SOURCE.read_text(encoding="utf-8-sig").splitlines(), 1
+          ):
+              value = raw_line.strip()
+              if not value or value.startswith("#"):
+                  continue
+              special_rules.append(special_rule_entry(value, line_number))
+
+          special_rules = list(dict.fromkeys(special_rules))
+          SPECIAL_LIST.write_text(
+              "# 由 build/factory/special_proxy.txt 自动生成，请勿直接修改。\n"
+              + ("\n".join(special_rules) + "\n" if special_rules else "# 暂无特殊需求规则\n"),
+              encoding="utf-8",
+          )
+
+          content = CONF.read_text(encoding="utf-8")
+
+          def replace_unique_group(text, name, replacement):
+              pattern = rf"(?m)^{re.escape(name)} = .*$"
+              if len(re.findall(pattern, text)) != 1:
+                  raise SystemExit(
+                      f"ERROR: 找不到唯一的 {name} 策略组，上游结构可能已变化。"
+                  )
+              return re.sub(pattern, replacement, text, count=1)
+
+          if AI_RULE not in content:
+              raise SystemExit("ERROR: 找不到通用 AI 规则，上游结构可能已变化。")
+
+          content = replace_unique_group(
+              content,
+              "AI",
+              AI_GROUP + "\n" + SPECIAL_GROUP,
+          )
+          content = replace_unique_group(content, "TikTok", TIKTOK_GROUP)
+
+          rule_headers = re.findall(r"(?m)^\[Rule\]\s*$", content)
+          if len(rule_headers) != 1:
+              raise SystemExit("ERROR: 找不到唯一的 [Rule] 段，上游结构可能已变化。")
+          content = re.sub(
+              r"(?m)^\[Rule\]\s*$",
+              lambda match: match.group(0) + "\n" + SPECIAL_RULE,
+              content,
+              count=1,
+          )
+
+          provider_groups = []
+          rewritten_defaults = []
+
+          for region, regex in REGIONS:
+              group_name = f"{region}节点"
+              pattern = rf"(?m)^{re.escape(group_name)} = .*$"
+              matches = re.findall(pattern, content)
+
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"ERROR: 找不到唯一的原版 {group_name}，上游结构可能已变化。"
+                  )
+
+              provider_choices = ",".join(
+                  f"{group_name}-{provider}" for provider in PROVIDERS
+              )
+              rewritten = (
+                  f"{group_name} = select,{provider_choices},"
+                  f"policy-select-name={group_name}-{DEFAULT_PROVIDER}"
+              )
+              content = re.sub(pattern, rewritten, content, count=1)
+              rewritten_defaults.append(rewritten)
+
+              for provider in PROVIDERS:
+                  provider_groups.append(provider_group(region, regex, provider))
+
+          # LOWERTOP 当前以“美国节点”结束原版地区组；专属组统一追加在其后。
+          us_default = rewritten_defaults[-1]
+          if us_default not in content:
+              raise SystemExit("ERROR: 美国节点改写失败，停止发布。")
+
+          content = content.replace(
+              us_default,
+              us_default + "\n" + "\n".join(provider_groups),
+              1,
+          )
+          required = [
+              AI_GROUP,
+              SPECIAL_GROUP,
+              TIKTOK_GROUP,
+              SPECIAL_RULE,
+              *rewritten_defaults,
+              *provider_groups,
+          ]
+          for item in required:
+              if content.count(item) != 1:
+                  raise SystemExit(f"ERROR: 自定义配置写入异常：{item}")
+
+          CONF.write_text(content, encoding="utf-8")
+
+          print("==============================================")
+          print("自定义 Shadowrocket 配置生成成功")
+          print("机场名单：" + "、".join(PROVIDERS))
+          print(f"默认六区：手动选择机场，默认 {DEFAULT_PROVIDER}")
+          print("机场地区子组：各自测速并选择最快节点")
+          print("机场缺少地区节点：继续发布，可手动切换其他机场")
+          print(f"AI：统一分组，默认 {AI_DEFAULT}")
+          print(
+              f"特殊需求：{len(special_rules)} 条，默认 {SPECIAL_DEFAULT}"
+          )
+          print(f"TikTok：独立分组，默认 {TIKTOK_DEFAULT}")
+          print("==============================================")
+          PY
+
+      - name: Remove commits
+        run: |
+          cd release || exit 1
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout --orphan latest_branch
+          git add -A
+          git commit -am "Nightly build"
+          git branch -D release
+          git branch -m release
+          git push -f origin release
