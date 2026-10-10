@@ -1,0 +1,328 @@
+name: Release Shadowrocket Rules
+
+on:
+  schedule:
+    # 每日北京时间 08:30 计划运行；GitHub Actions 实际可能晚几分钟。
+    - cron: '30 0 * * *'
+
+  push:
+    branches:
+      - build
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+  pull_request_target:
+    branches:
+      - build
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+  workflow_dispatch:
+
+jobs:
+  Release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: build
+          path: build
+
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+          path: release
+
+      - name: Install requirements
+        run: pip3 install -r build/requirements.txt
+
+      - name: Build Rules
+        run: |
+          cd build || exit 1
+          ./factory/auto_build.sh
+
+      - name: Move files
+        run: |
+          cd build || exit 1
+          cp *.conf ../release/
+          cp -r figure ../release/
+          cp LICENSE ../release/
+          cp readme.md ../release/
+
+      - name: Update lazy rules
+        run: |
+          set -euo pipefail
+          cd release
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 --output .lazy.upstream.conf https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 --output .lazy_group.upstream.conf https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy_group.conf
+          python3 - <<'PYCONF'
+          import ipaddress
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          
+          
+          def fail(message):
+              raise SystemExit("ERROR: " + message)
+          
+          
+          REGIONS = (
+              ("香港", r"🇭🇰|香港|Hong\ Kong|HongKong"),
+              ("台湾", r"🇹🇼|台湾|台灣|台北|台中|新北|彰化|Taiwan|Taipei"),
+              ("日本", r"🇯🇵|日本|东京|東京|大阪|Japan|Tokyo|Osaka"),
+              ("新加坡", r"🇸🇬|新加坡|狮城|獅城|Singapore"),
+              ("韩国", r"🇰🇷|韩国|韓國|首尔|首爾|Korea|Seoul"),
+              ("美国", r"🇺🇸|美国|美國|洛杉矶|洛杉磯|圣何塞|聖何塞|西雅图|西雅圖|纽约|紐約|United\ States"),
+          )
+          REGION_NAMES = tuple(region + "节点" for region, _ in REGIONS)
+          BUILTINS = {"DIRECT", "PROXY", "REJECT", "REJECT-DROP", "REJECT-TINYGIF", "REJECT-DICT", "REJECT-ARRAY"}
+          PROVIDERS = ("KTM",)
+          repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+              fail("GITHUB_REPOSITORY 无效。")
+          BASE_URL = f"https://raw.githubusercontent.com/{repository}/release/"
+          SPECIAL_RULE = f"RULE-SET,{BASE_URL}special_proxy.list,特殊需求"
+          AI_RULE = "RULE-SET,https://raw.githubusercontent.com/iab0x00/ProxyRules/main/Rule/AI.txt,AI"
+          
+          
+          def parse_conf(text):
+              """保留所有上游章节；重复章节或异常下载不能进入发布。"""
+              preamble, sections = [], {}
+              current = preamble
+              for line in text.splitlines():
+                  match = re.fullmatch(r"\s*\[([^\]]+)\]\s*", line)
+                  if match:
+                      name = match.group(1).strip()
+                      if any(key.casefold() == name.casefold() for key in sections):
+                          fail(f"配置含重复章节 [{name}]。")
+                      sections[name] = []
+                      current = sections[name]
+                  else:
+                      current.append(line)
+              for required in ("General", "Rule"):
+                  if required not in sections:
+                      fail(f"上游缺少 [{required}]，可能下载了错误内容。")
+              if any(re.match(r"\s*include\s*=", line, re.I) for line in sections["General"]):
+                  fail("上游新增了 include，需确认继承关系后再拆分配置。")
+              return preamble, sections
+          
+          
+          def active(lines):
+              return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith(("#", ";", "//"))]
+          
+          
+          def render_conf(preamble, sections, filename, group_lines=None, omit_groups=False):
+              output = list(preamble)
+              for section, body in sections.items():
+                  if section == "Proxy Group" and omit_groups:
+                      continue
+                  output.append(f"[{section}]")
+                  if section == "General":
+                      output.append(f"update-url = {BASE_URL}{filename}")
+                      output.extend(line for line in body if not re.match(r"\s*update-url\s*=", line, re.I))
+                  elif section == "Proxy Group" and group_lines is not None:
+                      output.extend(group_lines)
+                      output.append("")
+                  else:
+                      output.extend(body)
+              return "\n".join(output).rstrip() + "\n"
+          
+          
+          def special_rule_entry(value, line_number):
+              if "://" in value:
+                  try:
+                      value = urlsplit(value).hostname
+                  except ValueError:
+                      value = None
+                  if not value:
+                      fail(f"special_proxy.txt 第 {line_number} 行 URL 无效。")
+              value = value.strip().rstrip(".")
+              if value.startswith("*."):
+                  value = value[2:]
+              try:
+                  network = ipaddress.ip_network(value, strict=False)
+              except ValueError:
+                  if any(char.isspace() for char in value) or "/" in value:
+                      fail(f"special_proxy.txt 第 {line_number} 行格式无效。")
+                  try:
+                      domain = value.encode("idna").decode("ascii").lower()
+                  except UnicodeError:
+                      fail(f"special_proxy.txt 第 {line_number} 行域名无效。")
+                  if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", domain):
+                      fail(f"special_proxy.txt 第 {line_number} 行域名无效。")
+                  return f"DOMAIN-SUFFIX,{domain}"
+              rule_type = "IP-CIDR" if network.version == 4 else "IP-CIDR6"
+              return f"{rule_type},{network.with_prefixlen},no-resolve"
+          
+          
+          source = Path("../build/factory/special_proxy.txt")
+          if not source.is_file():
+              fail("缺少 build/factory/special_proxy.txt。")
+          special_rules = list(dict.fromkeys(
+              special_rule_entry(line.strip(), index)
+              for index, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), 1)
+              if line.strip() and not line.lstrip().startswith("#")
+          ))
+          
+          preamble, sections = parse_conf(Path(".lazy_group.upstream.conf").read_text(encoding="utf-8-sig"))
+          simple_preamble, simple_sections = parse_conf(Path(".lazy.upstream.conf").read_text(encoding="utf-8-sig"))
+          if "Proxy Group" not in sections:
+              fail("上游缺少 [Proxy Group]。")
+          if active(sections["Rule"]).count(AI_RULE) != 1:
+              fail("找不到唯一的通用 AI 规则，上游可能已变化。")
+          if SPECIAL_RULE in active(sections["Rule"]):
+              fail("上游意外包含本仓库特殊规则，停止重复注入。")
+          sections["Rule"] = [SPECIAL_RULE, "", *sections["Rule"]]
+          
+          original = {}
+          for line in active(sections["Proxy Group"]):
+              if "=" not in line:
+                  fail("上游代理分组格式异常。")
+              name, value = (part.strip() for part in line.split("=", 1))
+              if name in original:
+                  fail(f"上游包含重复分组：{name}")
+              original[name] = [part.strip() for part in value.split(",")]
+          for name in ("AI", "TikTok", *REGION_NAMES):
+              if name not in original:
+                  fail(f"上游缺少分组：{name}")
+          if "特殊需求" in original:
+              fail("上游已有同名特殊需求分组，需人工确认。")
+          
+          groups, group_lines = {}, [
+              "# 所有分组默认手动选择；从小火箭首页下拉设置地区和具体节点。",
+              "# 模板不预填 policy-select-name；小火箭保存手动选择时自行写入的值可以保留。",
+          ]
+          
+          
+          def add_group(name, parts):
+              if name in groups:
+                  fail(f"生成了重复分组：{name}")
+              groups[name] = parts
+              group_lines.append(name + " = " + ",".join(parts))
+          
+          
+          for name, parts in original.items():
+              if name in REGION_NAMES:
+                  continue
+              if parts[0] != "select":
+                  fail(f"上游新增非手动服务组 {name}，需确认配置结构。")
+              if name in ("AI", "TikTok"):
+                  choices = ["PROXY", *REGION_NAMES]
+              else:
+                  choices = [part for part in parts[1:] if "=" not in part]
+                  preset = next((part.split("=", 1)[1] for part in parts if part.startswith("policy-select-name=")), None)
+                  # 只保留首次导入时 DIRECT/PROXY 的排列习惯，不写入强制选中参数。
+                  if preset in {"PROXY", "DIRECT"} and preset in choices:
+                      choices = [preset, *(choice for choice in choices if choice != preset)]
+              if not choices:
+                  fail(f"上游服务组没有可保留的选项：{name}")
+              add_group(name, ["select", *dict.fromkeys(choices)])
+              if name == "AI":
+                  add_group("特殊需求", ["select", "PROXY", *REGION_NAMES])
+          
+          group_lines.extend(["", "# 六个地区直接筛选 KTM 订阅节点，手动选择具体节点。"])
+          for region, regex in REGIONS:
+              re.compile(regex)
+              add_group(f"{region}节点", ["select", "KTM", "use=true", f"policy-regex-filter={regex}"])
+          
+          # 检查所有引用，防止缺少子组、同名订阅歧义或循环引用。
+          if set(PROVIDERS) & set(groups):
+              fail("KTM 订阅名称与代理分组重名。")
+          graph = {}
+          for name, parts in groups.items():
+              if "use=true" in parts:
+                  graph[name] = []
+                  continue
+              members = parts[1:]
+              unknown = set(members) - set(groups) - BUILTINS
+              if unknown:
+                  fail(f"{name} 引用了未定义策略：{'、'.join(sorted(unknown))}")
+              graph[name] = [member for member in members if member in groups]
+          visited, visiting = set(), set()
+          
+          
+          def visit(name):
+              if name in visiting:
+                  fail(f"分组循环引用：{name}")
+              if name in visited:
+                  return
+              visiting.add(name)
+              for child in graph[name]:
+                  visit(child)
+              visiting.remove(name)
+              visited.add(name)
+          
+          
+          for name in graph:
+              visit(name)
+          canonical_policies = {}
+          for name in (*groups, *BUILTINS):
+              if name.casefold() in canonical_policies:
+                  fail(f"分组名称存在大小写歧义：{name}")
+              canonical_policies[name.casefold()] = name
+          for line_index, rule in enumerate(sections["Rule"]):
+              if not active([rule]):
+                  continue
+              parts = rule.split(",")
+              # 复合规则保留原文；普通规则检查策略是否有对应分组。
+              if parts[0].strip() in {"AND", "OR", "NOT"}:
+                  continue
+              index = 1 if parts[0].strip() == "FINAL" else 2
+              if len(parts) <= index or parts[index].strip().casefold() not in canonical_policies:
+                  fail(f"规则引用了未定义策略或格式异常：{rule}")
+              # 上游存在 YOUTUBE/YouTube 等大小写差异；输出统一为实际分组名。
+              canonical = canonical_policies[parts[index].strip().casefold()]
+              if parts[index].strip() != canonical:
+                  parts[index] = canonical
+                  sections["Rule"][line_index] = ",".join(parts)
+          
+          local_text = (
+              "# 本地手动分组模板：首次复制到扩展配置，日常只更新 lazy_rules.conf。\n"
+              "# 不要给这个本地扩展添加 update-url，也不要用远程模板覆盖已保存的选择。\n"
+              "[General]\ninclude = lazy_rules.conf\n\n[Proxy Group]\n"
+              + "\n".join(group_lines).rstrip() + "\n"
+          )
+          rules_text = render_conf(preamble, sections, "lazy_rules.conf", omit_groups=True)
+          full_text = render_conf(preamble, sections, "lazy_group.conf", group_lines=group_lines)
+          _, remote_sections = parse_conf(rules_text)
+          if "Proxy Group" in remote_sections:
+              fail("纯规则文件仍含代理分组。")
+          if any(part.startswith(("policy-select-name=", "select=", "interval=", "url=", "timeout=", "tolerance=")) for parts in groups.values() for part in parts):
+              fail("手动分组中残留默认选中或自动测速参数。")
+          
+          outputs = {
+              "lazy.conf": render_conf(simple_preamble, simple_sections, "lazy.conf"),
+              "lazy_group.conf": full_text,
+              "lazy_rules.conf": rules_text,
+              "my_split.conf": local_text,
+              "special_proxy.list": (
+                  "# 由 build/factory/special_proxy.txt 自动生成，请勿直接修改。\n"
+                  + ("\n".join(special_rules) + "\n" if special_rules else "# 暂无特殊需求规则\n")
+              ),
+          }
+          for filename, content in outputs.items():
+              target = Path(filename)
+              temporary = target.with_name(target.name + ".tmp")
+              temporary.write_text(content, encoding="utf-8")
+              temporary.replace(target)
+          print("已生成：" + "、".join(outputs))
+          print("机场名单：" + "、".join(PROVIDERS))
+          print(f"手动分组：{len(groups)} 个；自动测速默认关闭；特殊需求规则：{len(special_rules)} 条。")
+          print("日常更新 lazy_rules.conf；my_split.conf 仅作首次配置模板。")
+          PYCONF
+          rm -f .lazy.upstream.conf .lazy_group.upstream.conf
+
+      - name: Remove commits
+        run: |
+          cd release || exit 1
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout --orphan latest_branch
+          git add -A
+          git commit -am "Nightly build"
+          git branch -D release
+          git branch -m release
+          git push -f origin release
